@@ -1,0 +1,102 @@
+// oneword: a bond that anyone can slash once its attester signs two
+// different statements for the same epoch.
+//
+// The attester signs statements off chain:
+//     statement = blake2b(domain || epoch (8 bytes) || body (32 bytes))
+// One body per epoch is the promise. Two valid signatures over two different
+// bodies for the same epoch are a self-contained proof that the promise was
+// broken; no referee is needed. Roles:
+//   attester    - signs statements; exit() starts unbonding, rejoin() stops it,
+//                 withdraw() takes the bond after `unbond_delay` DAA.
+//   anyone      - slash() with an equivocation proof, from Bond or Unbonding.
+//                 Output 0 must pay `beneficiary` at least (100 - bounty_pct)%
+//                 of the bond; the slasher keeps the rest and pays the fee.
+//   anyone      - topup() a live bond by at least `min_topup`.
+
+state BondState {
+    pubkey attester;
+    byte[32] domain;
+    pubkey beneficiary;
+    int bounty_pct;
+    int unbond_delay;
+    int min_topup;
+}
+
+fn statement(byte[32] domain, byte[8] epoch, byte[32] body) -> byte[32] {
+    return blake2b(byte[](domain + epoch + body));
+}
+
+fn paid_out(int bond, int bounty_pct, pubkey beneficiary) -> bool {
+    // One bond per slash transaction, so output 0 cannot be counted twice.
+    require(tx.inputs.length == 1);
+    int bounty = bond * bounty_pct / 100;
+    byte[36] dest = new ScriptPubKeyP2PK(beneficiary);
+    require(tx.outputs[0].scriptPubKey == byte[](dest));
+    require(tx.outputs[0].value >= bond - bounty);
+    return true;
+}
+
+fn equivocated(byte[32] domain, pubkey attester, byte[8] epoch,
+               byte[32] body_a, datasig sig_a, byte[32] body_b, datasig sig_b) -> bool {
+    require(body_a != body_b);
+    require(checkMsgSig(sig_a, statement(domain, epoch, body_a), attester));
+    require(checkMsgSig(sig_b, statement(domain, epoch, body_b), attester));
+    return true;
+}
+
+actor Bond owns BondState {
+    entry topup() emits next: Bond {
+        require(next.value >= self.value + min_topup);
+        become next <- self;
+    }
+
+    entry exit(sig attester_sig) emits next: Unbonding {
+        require(checkSig(attester_sig, attester));
+        require(next.value == self.value);
+        BondState same = {
+            attester: attester,
+            domain: domain,
+            beneficiary: beneficiary,
+            bounty_pct: bounty_pct,
+            unbond_delay: unbond_delay,
+            min_topup: min_topup,
+        };
+        become next <- Unbonding(same);
+    }
+
+    entry slash(byte[8] epoch, byte[32] body_a, datasig sig_a, byte[32] body_b, datasig sig_b) emits none {
+        require(equivocated(domain, attester, epoch, body_a, sig_a, body_b, sig_b));
+        require(paid_out(self.value, bounty_pct, beneficiary));
+    }
+}
+
+actor Unbonding owns BondState {
+    entry rejoin(sig attester_sig) emits next: Bond {
+        require(checkSig(attester_sig, attester));
+        require(next.value == self.value);
+        BondState same = {
+            attester: attester,
+            domain: domain,
+            beneficiary: beneficiary,
+            bounty_pct: bounty_pct,
+            unbond_delay: unbond_delay,
+            min_topup: min_topup,
+        };
+        become next <- Bond(same);
+    }
+
+    entry withdraw(sig attester_sig) emits none {
+        require(this.ageDaa >= unbond_delay);
+        require(checkSig(attester_sig, attester));
+    }
+
+    entry slash(byte[8] epoch, byte[32] body_a, datasig sig_a, byte[32] body_b, datasig sig_b) emits none {
+        require(equivocated(domain, attester, epoch, body_a, sig_a, body_b, sig_b));
+        require(paid_out(self.value, bounty_pct, beneficiary));
+    }
+}
+
+app OneWord {
+    actor Bond;
+    actor Unbonding;
+}
